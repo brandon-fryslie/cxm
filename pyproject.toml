@@ -1,0 +1,12 @@
+[project]
+name = "cxm"
+version = "0.1.0"
+description = "Codex Multi-Account Credential Manager"
+requires-python = ">=3.10"
+
+[project.scripts]
+cxm = "cxm:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
