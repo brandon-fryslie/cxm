@@ -14,11 +14,11 @@ No tests, linting, or formatting tooling exists. The project has zero dependenci
 
 ## Architecture
 
-Single-file CLI tool (`cxm.py`, ~770 lines) that manages multiple Codex CLI accounts by vaulting `auth.json` files.
+Single-file CLI tool (`cxm.py`, ~1560 lines) that manages multiple Codex CLI accounts by vaulting `auth.json` files.
 
 **Data flow:** `accounts.json` (registry) → per-account `credentials/<name>/auth.json` → symlink into `~/.codex/auth.json`
 
-**Subcommand dispatch:** `build_parser()` creates argparse subcommands → `COMMANDS` dict maps names to `cmd_*` handlers → `main()` dispatches. All commands are top-level functions, no classes.
+**Subcommand dispatch:** `build_parser()` creates argparse subcommands → `COMMANDS` dict maps names to `cmd_*` handlers → `main()` dispatches. Invoking `cxm` with no subcommand enters the interactive TUI (`cmd_interactive`). All commands are top-level functions, no classes.
 
 **Key paths:**
 - `~/.codex-accounts/accounts.json` — single source of truth for account registry
@@ -27,11 +27,15 @@ Single-file CLI tool (`cxm.py`, ~770 lines) that manages multiple Codex CLI acco
 - `~/.codex/auth.json` — symlink target (the active account)
 
 **External tool integration:**
-- `codex login` — OAuth flow, invoked with `CODEX_HOME` override and `BROWSER` env var for Chrome profile isolation
+- `codex login` — OAuth flow, run in a PTY (not a pipe) so Rust output isn't buffered; auth URL is intercepted from PTY output and Chrome is opened manually
 - `codexbar usage --provider codex --source cli --json` — usage/quota queries, parallelized via ThreadPoolExecutor
-- Google Chrome — launched with `--user-data-dir` for per-account browser isolation
+- Google Chrome at `/Applications/Google Chrome.app/...` — launched with `--user-data-dir` for per-account browser isolation and `--remote-debugging-port` for CDP
+
+**CDP auto-login layer:** If an account has credentials in macOS Keychain (services `cxm-email`, `cxm-password`, `cxm-totp`), `_cdp_automate_login` connects to Chrome via a stdlib WebSocket implementation and drives the OpenAI OAuth flow (email → password → TOTP) automatically. Credentials are stored/retrieved via `security find-generic-password`.
 
 **Scoring algorithm** (`cmd_best`): Ranks accounts by `weekly_remaining * 100 + session_remaining * 10 + resets_soon_bonus(500) - depleted_penalty(10000)`.
+
+**Interactive TUI** (`cmd_interactive`): Renders a live account list with animated spinners while usage queries run in parallel, then plays a rainbow wave animation on completion. Press a digit to activate that account. The `--wave-speed` flag (default 100) is on the top-level parser and controls the TUI animation speed.
 
 ## Exit codes
 

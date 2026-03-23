@@ -10,11 +10,13 @@ The tool treats auth.json as the per-account identity. Your real CODEX_HOME
 
 import argparse
 import base64
+import getpass
 import hashlib
 import hmac
 import json
 import os
 import pty
+import random as _random
 import re
 import select
 import shutil
@@ -79,6 +81,61 @@ def keychain_has_creds(name: str) -> bool:
     )
 
 
+def keychain_set(name: str, service: str, value: str):
+    """Store a value in macOS Keychain, creating or updating the entry."""
+    subprocess.run(
+        ["security", "add-generic-password", "-a", name, "-s", service, "-w", value, "-U"],
+        capture_output=True, check=True,
+    )
+
+
+def keychain_delete(name: str, service: str):
+    """Remove a value from macOS Keychain. No-op if not found."""
+    subprocess.run(
+        ["security", "delete-generic-password", "-a", name, "-s", service],
+        capture_output=True,
+    )
+
+
+# ── Credential collection pipeline ───────────────────────────────────────────
+# [LAW:dataflow-not-control-flow] Three stages always run; data decides behavior.
+
+_CRED_SERVICES = ("cxm-email", "cxm-password", "cxm-totp")
+
+
+def missing_creds(name: str) -> list[str]:
+    """Return which Keychain services are absent for this account."""
+    return [svc for svc in _CRED_SERVICES if not keychain_get(name, svc)]
+
+
+def collect_creds(missing: list[str]) -> dict[str, str]:
+    """Prompt for each missing credential. Returns {} if nothing missing or user skips."""
+    if not missing:
+        return {}
+    prompts = {
+        "cxm-email":    ("  Email: ",               input),
+        "cxm-password": ("  Password: ",             getpass.getpass),
+        "cxm-totp":     ("  TOTP secret (base32): ", getpass.getpass),
+    }
+    print("Enter credentials for auto-login:")
+    collected = {}
+    for svc in missing:
+        label, fn = prompts[svc]
+        value = fn(label).strip()
+        if not value:
+            return {}
+        collected[svc] = value
+    return collected
+
+
+def store_creds(name: str, creds: dict[str, str]):
+    """Write collected credentials to Keychain. No-op on empty dict."""
+    for svc, value in creds.items():
+        keychain_set(name, svc, value)
+    if creds:
+        print(f"  {C_GREEN}Credentials stored in Keychain.{C_RESET}")
+
+
 def load_accounts() -> list[dict]:
     """Load account registry. Returns empty list if no file."""
     if not ACCOUNTS_JSON.exists():
@@ -107,7 +164,8 @@ def credential_dir(name: str) -> Path:
 
 def chrome_profile_dir(name: str) -> Path:
     """Per-account Chrome user-data-dir."""
-    return CHROME_PROFILES_DIR / name
+    safe = re.sub(r'[^a-zA-Z0-9_-]', '_', name)
+    return CHROME_PROFILES_DIR / safe
 
 
 def active_account_name() -> str | None:
@@ -418,10 +476,6 @@ def format_credits(credits_data: dict | None) -> str:
 def cmd_add(args):
     """Create a new account profile and initiate login."""
     name = args.name
-    if not name.replace("-", "").replace("_", "").isalnum():
-        print(f"Error: Account name must be alphanumeric (hyphens/underscores OK)", file=sys.stderr)
-        return 1
-
     ensure_dirs()
     accounts = load_accounts()
 
@@ -448,9 +502,145 @@ def cmd_add(args):
     print(f"  Chrome profile: {chrome_profile_dir(name)}")
     print()
 
-    # Immediately start login
+    # Immediately start login — clean up on failure or cancellation
     args.name = name
-    return cmd_login(args)
+    try:
+        result = cmd_login(args)
+    except (KeyboardInterrupt, EOFError):
+        print(f"\n  {C_YELLOW}Cancelled — removing '{name}'.{C_RESET}")
+        _remove_account_data(name)
+        return 1
+    if result != 0:
+        print(f"  {C_RED}Login failed — removing '{name}'.{C_RESET}")
+        _remove_account_data(name)
+    return result
+
+
+def _parse_quick_input(text: str) -> list[dict]:
+    """Parse one or more pasted credential blobs into a list of {name, email, password, totp}.
+
+    Each account needs three lines (any order): email (@), password, TOTP (base32).
+    Accounts are separated by blank lines or just run together — a new email line
+    starts a new account. Name is derived from the email address.
+
+    Returns list of parsed accounts. Skips any group that doesn't have all three fields.
+    """
+    lines = [ln.strip() for ln in text.splitlines()]
+    non_empty = [ln for ln in lines if ln]
+
+    # Split into groups: each group starts with an email line
+    groups: list[list[str]] = []
+    current: list[str] = []
+    for ln in non_empty:
+        if "@" in ln and current:
+            # New email = new account group
+            groups.append(current)
+            current = [ln]
+        else:
+            current.append(ln)
+    if current:
+        groups.append(current)
+
+    results = []
+    for group in groups:
+        email = password = totp = ""
+        for ln in group:
+            if "@" in ln and not email:
+                email = ln
+            elif re.fullmatch(r"[A-Z2-7]{16,}", ln.replace(" ", "").replace("-", "")) and not totp:
+                totp = ln
+            elif not password:
+                password = ln
+        if not all((email, password, totp)):
+            continue
+        # Name = email with dots/@ replaced to be filesystem-safe
+        name = re.sub(r"[^a-zA-Z0-9_-]", "-", email).strip("-")
+        results.append({"name": name, "email": email, "password": password, "totp": totp})
+
+    return results
+
+
+def _remove_account_data(name: str):
+    """Remove account entry, credentials dir, chrome profile, and keychain entries."""
+    accounts = load_accounts()
+    accounts = [a for a in accounts if a["name"] != name]
+    save_accounts(accounts)
+    cred_dir = credential_dir(name)
+    if cred_dir.exists():
+        shutil.rmtree(cred_dir)
+    chrome_dir = chrome_profile_dir(name)
+    if chrome_dir.exists():
+        shutil.rmtree(chrome_dir)
+    for svc in _CRED_SERVICES:
+        keychain_delete(name, svc)
+
+
+def cmd_quick(args):
+    """Parse pasted credentials, create accounts, login each, remove failures."""
+    print("Paste account credentials (email, password, TOTP — one or more accounts).")
+    print("Press Ctrl-D when done:\n")
+
+    lines = []
+    try:
+        while True:
+            lines.append(input())
+    except EOFError:
+        pass
+
+    text = "\n".join(lines)
+    parsed_list = _parse_quick_input(text)
+    if not parsed_list:
+        print("\nError: Could not parse any accounts. Need email, password, and TOTP secret per account.", file=sys.stderr)
+        return 1
+
+    print(f"\nParsed {len(parsed_list)} account(s).")
+    ensure_dirs()
+    failures = 0
+
+    for parsed in parsed_list:
+        name = parsed["name"]
+        print(f"\n{'─' * 40}")
+        print(f"Account: {parsed['email']}")
+
+        accounts = load_accounts()
+        if find_account(accounts, name):
+            print(f"  {C_YELLOW}Already exists, skipping.{C_RESET}")
+            continue
+
+        # Create account entry
+        cred_dir = credential_dir(name)
+        cred_dir.mkdir(parents=True, exist_ok=True)
+        chrome_profile_dir(name).mkdir(parents=True, exist_ok=True)
+
+        account = {
+            "name": name,
+            "email": parsed["email"],
+            "plan": "",
+            "description": "",
+            "added_at": datetime.now(timezone.utc).isoformat(),
+        }
+        accounts.append(account)
+        save_accounts(accounts)
+
+        # Store credentials in Keychain
+        keychain_set(name, "cxm-email", parsed["email"])
+        keychain_set(name, "cxm-password", parsed["password"])
+        keychain_set(name, "cxm-totp", parsed["totp"])
+        print(f"  {C_GREEN}Credentials stored.{C_RESET}")
+
+        # Run login
+        args.name = name
+        args.login_mode = "auto"
+        result = cmd_login(args)
+
+        if result != 0:
+            print(f"  {C_RED}Login failed — removing '{name}'.{C_RESET}")
+            _remove_account_data(name)
+            failures += 1
+        else:
+            print(f"  {C_GREEN}OK{C_RESET}")
+
+    return 1 if failures == len(parsed_list) else 0
 
 
 def cmd_login(args):
@@ -467,6 +657,21 @@ def cmd_login(args):
 
     chrome_dir = chrome_profile_dir(name)
     chrome_dir.mkdir(parents=True, exist_ok=True)
+
+    # [LAW:dataflow-not-control-flow] Pipeline always runs: check → collect → store.
+    # Mode decides what the pipeline's output means: 'manual' permits browser login,
+    # 'auto' requires Keychain credentials (existing or freshly prompted).
+    mode = getattr(args, "login_mode", "auto")
+    missing = missing_creds(name)
+    collected = collect_creds(missing)
+    store_creds(name, collected)
+    has_creds = keychain_has_creds(name)
+
+    # [LAW:single-enforcer] Mode is the single gate for manual browser login.
+    if mode != "manual" and not has_creds:
+        print(f"Error: Auto-login requires credentials. Re-run and provide them,", file=sys.stderr)
+        print(f"  or use --login-mode manual for browser login.", file=sys.stderr)
+        return 1
 
     codex = shutil.which("codex")
     if not codex:
@@ -592,7 +797,13 @@ def _cdp_automate_login(cdp_port: int, name: str) -> bool:
             return ev("""
                 (() => {
                     const el = document.querySelector('[role="alert"], .error-message, [data-testid="error-message"], .text-danger, .field-error');
-                    return el ? el.textContent.trim() : null;
+                    if (el) return el.textContent.trim();
+                    const needle = 'An error occurred during authentication';
+                    let best = null;
+                    for (const d of document.querySelectorAll('div')) {
+                        if (d.textContent.includes(needle)) best = d;
+                    }
+                    return best ? best.textContent.trim() : null;
                 })()
             """)
 
@@ -753,6 +964,11 @@ def _cdp_automate_login(cdp_port: int, name: str) -> bool:
             if "localhost" in url:
                 print(f"  {C_GREEN}Login automated successfully{C_RESET}", flush=True)
                 return True
+            # Check for auth errors during redirect wait
+            err = check_error()
+            if err:
+                print(f"  {C_RED}Auth error: {err}{C_RESET}", flush=True)
+                return False
             # Consent page: click Continue to authorize
             if "consent" in url and not consent_clicked:
                 log("Clicking consent...")
@@ -1229,6 +1445,52 @@ def cmd_refresh(args):
     return 0
 
 
+def cmd_cleanup(args):
+    """Check all accounts and prompt to remove invalid ones."""
+    accounts = load_accounts()
+    if not accounts:
+        print("No accounts configured.")
+        return 0
+
+    # Validate via usage query (same as the interactive TUI)
+    print(f"{C_DIM}Checking {len(accounts)} account(s)...{C_RESET}", file=sys.stderr)
+    usage_map = query_all_usage(accounts)
+
+    invalid = []
+    for acct in accounts:
+        name = acct["name"]
+        usage = usage_map.get(name)
+        if usage is None:
+            reason = "no auth.json" if not (credential_dir(name) / "auth.json").exists() else "usage query failed"
+            print(f"  {C_RED}✗{C_RESET} {name}: {reason}")
+            invalid.append((name, reason))
+        else:
+            print(f"  {C_GREEN}✓{C_RESET} {name}")
+
+    if not invalid:
+        print(f"{C_GREEN}All accounts are valid.{C_RESET}")
+        return 0
+
+    print(f"\nFound {len(invalid)} invalid account(s):\n")
+    removed = 0
+    for name, reason in invalid:
+        print(f"  {C_RED}✗{C_RESET} {name}: {reason}")
+        try:
+            answer = input(f"    Remove '{name}'? [Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if answer != "n":
+            _remove_account_data(name)
+            print(f"    {C_GREEN}Removed.{C_RESET}")
+            removed += 1
+        else:
+            print(f"    {C_DIM}Kept.{C_RESET}")
+
+    print(f"\nRemoved {removed}/{len(invalid)} invalid account(s).")
+    return 0
+
+
 # ── CLI Dispatch ─────────────────────────────────────────────────────────────
 # [LAW:dataflow-not-control-flow] argparse subcommands are value-based dispatch.
 
@@ -1241,12 +1503,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     # add
     p_add = sub.add_parser("add", help="Create a new account and login")
-    p_add.add_argument("name", help="Account name (alphanumeric, hyphens, underscores)")
+    p_add.add_argument("name", help="Account name")
     p_add.add_argument("--description", "-d", default="", help="Account description")
 
     # login
     p_login = sub.add_parser("login", help="Log in to an account (device auth)")
     p_login.add_argument("name", help="Account name")
+
+    # --login-mode applies to both add and login
+    for p in (p_add, p_login):
+        p.add_argument(
+            "--login-mode", choices=["auto", "manual"], default="auto",
+            help="'auto' = CDP automation via stored Keychain credentials (default); 'manual' = browser only",
+        )
 
     # status
     sub.add_parser("status", help="Show all accounts with usage")
@@ -1281,6 +1550,12 @@ def build_parser() -> argparse.ArgumentParser:
     # refresh
     sub.add_parser("refresh", help="Refresh tokens for all accounts")
 
+    # quick
+    sub.add_parser("quick", help="Paste credentials to add and test-login an account")
+
+    # cleanup
+    sub.add_parser("cleanup", help="Check all accounts and remove invalid ones")
+
     return parser
 
 
@@ -1296,13 +1571,27 @@ COMMANDS = {
     "remove": cmd_remove,
     "chrome": cmd_chrome,
     "refresh": cmd_refresh,
+    "quick": cmd_quick,
+    "cleanup": cmd_cleanup,
 }
 
 
-def _format_row(num: int, acct: dict, active: str | None, usage: dict | None, loaded: bool) -> str:
-    """Format a single interactive-list row."""
+def _format_row(num: int, acct: dict, active: str | None, usage: dict | None, loaded: bool,
+                is_cursor: bool = False, is_best: bool = False) -> str:
+    """Format a single interactive-list row.
+
+    Two marker columns precede the name:
+      best_mark  — green → for the recommended account (expires soonest with >5% left)
+      curs_mark  — bright green ▶ for the keyboard cursor; dim · for the active account
+    """
     name = acct["name"]
-    marker = f"{C_CYAN}→{C_RESET}" if name == active else " "
+    best_mark = "\033[32m→\033[0m" if is_best   else " "
+    if is_cursor:
+        curs_mark = "\033[92m▶\033[0m"
+    elif name == active:
+        curs_mark = f"{C_CYAN}·{C_RESET}"
+    else:
+        curs_mark = " "
 
     def pad(s: str, width: int) -> str:
         """Pad string to width, ignoring ANSI escape codes."""
@@ -1329,7 +1618,7 @@ def _format_row(num: int, acct: dict, active: str | None, usage: dict | None, lo
         wr = format_reset(secondary.get("resetsAt"))
         usage_cols = f"{sp} {wp} {sr} / {wr}"
 
-    return f"  {num}. {marker} {name:<24} {usage_cols}"
+    return f"  {num:>2}. {best_mark}{curs_mark} {name:<24} {usage_cols}"
 
 
 _IS_MACOS = sys.platform == "darwin"
@@ -1402,6 +1691,95 @@ def _lolcat_wave(text: str, row: int, wavefront: float, ansi_re: re.Pattern,
     return "".join(out)
 
 
+def _fire_wave_row(text: str, wavefront: float, ansi_re: re.Pattern) -> str:
+    """Sweep fire colors left-to-right across a row.
+
+    Ahead of wavefront: dim gray.  In the wave zone: bright fire palette.
+    Behind the wave: cooling dark red.
+    """
+    plain = ansi_re.sub("", text)
+    W = 12.0
+    out = []
+    for col, ch in enumerate(plain):
+        dist = col - wavefront
+        if dist > 0:
+            out.append(f"\033[38;2;70;70;70m{ch}")
+        elif dist < -W:
+            out.append(f"\033[38;2;40;0;0m{ch}")
+        else:
+            t = 1.0 - abs(dist) / W          # 1.0 at wavefront, 0 at edge
+            if dist >= -W * 0.2:             # leading edge: yellow-white
+                r = 255; g = min(255, int(180 * t + 80)); b = min(80, int(60 * t))
+            elif dist >= -W * 0.55:          # middle: orange
+                r = 255; g = int(110 * t); b = 0
+            else:                            # trailing: deep red
+                r = max(80, int(180 * t)); g = int(10 * t); b = 0
+            out.append(f"\033[38;2;{r};{g};{b}m{ch}")
+    out.append("\033[0m")
+    return "".join(out)
+
+
+def _run_selection_animation(sel_idx: int, accounts: list, n: int, active: str | None,
+                              usage_map: dict, loaded: set, ansi_re: re.Pattern,
+                              wave_speed: float):
+    """Fire wave on selected row; random char-by-char dissolve on all others."""
+    rng = _random.Random()
+
+    # Snapshot every row without cursor/best markers — clean baseline for animation
+    row_snaps = [
+        _format_row(i + 1, accounts[i],
+                    active if i == sel_idx else None,
+                    usage_map.get(accounts[i]["name"]),
+                    accounts[i]["name"] in loaded)
+        for i in range(n)
+    ]
+    plain_snaps = [ansi_re.sub("", t) for t in row_snaps]
+
+    # Non-selected rows: sets of still-visible char column indices
+    alive: dict[int, set[int]] = {
+        i: set(range(len(plain_snaps[i])))
+        for i in range(n) if i != sel_idx
+    }
+
+    def write_row(idx: int, text: str):
+        lines_up = n - idx
+        sys.stdout.write(f"\033[{lines_up}A\033[2K\r{text}\033[{lines_up}B\r")
+
+    fire_speed  = wave_speed * 2
+    W           = 12.0
+    fire_len    = len(plain_snaps[sel_idx])
+    max_wf      = fire_len + W + 5
+    fade_dur    = max_wf / fire_speed + 0.5   # dissolve completes just after wave finishes
+    start       = time.monotonic()
+
+    while True:
+        elapsed   = time.monotonic() - start
+        wavefront = elapsed * fire_speed
+
+        # Fire wave on selected row
+        write_row(sel_idx, _fire_wave_row(row_snaps[sel_idx], wavefront, ansi_re))
+
+        # Random dissolve on every other row
+        fade_prob = min(0.9, elapsed / fade_dur) * 0.25
+        for i, chars in alive.items():
+            if chars and fade_prob > 0:
+                n_kill = max(1, int(len(chars) * fade_prob))
+                chars -= set(rng.sample(list(chars), min(n_kill, len(chars))))
+            alive_set = chars
+            plain     = plain_snaps[i]
+            faded = "".join(
+                f"\033[38;2;50;50;50m{ch}" if col in alive_set else " "
+                for col, ch in enumerate(plain)
+            ) + "\033[0m"
+            write_row(i, faded)
+
+        sys.stdout.flush()
+
+        if wavefront > max_wf and all(len(v) == 0 for v in alive.values()):
+            break
+        time.sleep(0.016)  # ~60 fps
+
+
 def cmd_interactive(args):
     """Interactive account selector with live usage updates."""
     accounts = load_accounts()
@@ -1409,124 +1787,194 @@ def cmd_interactive(args):
         print("No accounts configured. Run: cxm add <name>")
         return 0
 
-    active = active_account_name()
-    n = len(accounts)
-    usage_map: dict[str, dict | None] = {}
-    loaded: set[str] = set()
+    active      = active_account_name()
+    n           = len(accounts)
+    usage_map:  dict[str, dict | None] = {}
+    loaded:     set[str] = set()
 
-    # Print initial list with placeholders
+    # Keyboard cursor — starts on the currently active account (or row 0)
+    cursor_idx = 0
+    if active:
+        for i, a in enumerate(accounts):
+            if a["name"] == active:
+                cursor_idx = i
+                break
+
+    # best_idx — account with >5% weekly remaining that expires soonest
+    best_idx: list[int | None] = [None]
+
+    def compute_best() -> int | None:
+        best_i = None
+        best_reset = None
+        for i, acct in enumerate(accounts):
+            usage = usage_map.get(acct["name"])
+            if not usage:
+                continue
+            secondary = usage.get("usage", {}).get("secondary", {})
+            remaining = 100 - (secondary.get("usedPercent", 100) or 100)
+            if remaining <= 5:
+                continue
+            resets_at = secondary.get("resetsAt")
+            if not resets_at:
+                continue
+            reset_dt = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+            if best_reset is None or reset_dt < best_reset:
+                best_reset = reset_dt
+                best_i = i
+        return best_i
+
+    # Print initial rows
     for i, acct in enumerate(accounts):
-        print(_format_row(i + 1, acct, active, None, False))
-
-    # Position cursor after the list; rows are numbered 1..n from bottom
-    # Row i (0-indexed) is (n - i) lines above current cursor position
+        print(_format_row(i + 1, acct, active, None, False,
+                          is_cursor=(i == cursor_idx), is_best=False))
 
     ansi_strip_re = re.compile(r"\033\[[0-9;]*[A-Za-z]")
+    wave_hue    = _random.uniform(0, 6.28)
+    wave_spread = _random.uniform(1.0, 2.5)
 
-    import random as _rng
-    wave_hue = _rng.uniform(0, 6.28)
-    wave_spread = _rng.uniform(1.0, 2.5)
-
-    def update_row(idx: int, wavefront: float = -1.0):
-        """Redraw row idx in-place using ANSI cursor movement."""
-        lines_up = n - idx
-        acct = accounts[idx]
-        row = _format_row(idx + 1, acct, active, usage_map.get(acct["name"]), acct["name"] in loaded)
+    def render_row(idx: int, wavefront: float = -1.0) -> str:
+        row = _format_row(
+            idx + 1, accounts[idx], active,
+            usage_map.get(accounts[idx]["name"]),
+            accounts[idx]["name"] in loaded,
+            is_cursor=(idx == cursor_idx),
+            is_best=(idx == best_idx[0]),
+        )
         if wavefront >= 0:
             row = _lolcat_wave(row, idx, wavefront, ansi_strip_re, wave_hue, wave_spread)
-        sys.stdout.write(f"\033[{lines_up}A\033[2K\r{row}\033[{lines_up}B\r")
+        return row
+
+    def update_row(idx: int, wavefront: float = -1.0):
+        lines_up = n - idx
+        sys.stdout.write(f"\033[{lines_up}A\033[2K\r{render_row(idx, wavefront)}\033[{lines_up}B\r")
         sys.stdout.flush()
 
-    # Save terminal state for raw input
+    def read_key() -> str:
+        """Return a logical key name: 'UP', 'DOWN', 'ENTER', or the raw char."""
+        ch = sys.stdin.read(1)
+        if ch == "\033":
+            avail, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if avail:
+                rest = sys.stdin.read(2)
+                if rest == "[A": return "UP"
+                if rest == "[B": return "DOWN"
+        if ch in ("\r", "\n"):
+            return "ENTER"
+        return ch
+
+    def handle_key(key: str, selected_ref: list) -> bool:
+        """Process one keypress. Returns True when the loop should exit."""
+        nonlocal cursor_idx
+        if key == "UP":
+            old = cursor_idx
+            cursor_idx = max(0, cursor_idx - 1)
+            if old != cursor_idx:
+                update_row(old)
+                update_row(cursor_idx)
+        elif key == "DOWN":
+            old = cursor_idx
+            cursor_idx = min(n - 1, cursor_idx + 1)
+            if old != cursor_idx:
+                update_row(old)
+                update_row(cursor_idx)
+        elif key == "ENTER":
+            selected_ref[0] = cursor_idx
+            return True
+        elif key in ("q", "\x03"):
+            return True
+        elif key.isdigit() and 1 <= int(key) <= n:
+            old = cursor_idx
+            cursor_idx = int(key) - 1
+            selected_ref[0] = cursor_idx
+            if old != cursor_idx:
+                update_row(old)
+                update_row(cursor_idx)
+            return True
+        return False
+
     fd = sys.stdin.fileno()
     if not sys.stdin.isatty():
         print(f"\n{C_DIM}Not a terminal — use: cxm activate <name>{C_RESET}")
         return 0
     old_settings = termios.tcgetattr(fd)
-    executor = ThreadPoolExecutor(max_workers=min(n, 10))
+    executor     = ThreadPoolExecutor(max_workers=min(n, 10))
+    selected: list[int | None] = [None]
 
     try:
-        # Submit all usage queries
         futures = {executor.submit(query_usage, acct["name"]): i for i, acct in enumerate(accounts)}
-
-        # Enter raw mode for single-keypress input
         tty.setraw(fd)
 
         done = False
-        selected = None
         while not done:
-            # Check for completed futures
-            newly_done = [f for f in futures if f.done() and accounts[futures[f]]["name"] not in loaded]
+            # Collect completed usage futures
+            newly_done = [f for f in futures
+                          if f.done() and accounts[futures[f]]["name"] not in loaded]
+            recompute = False
             for f in newly_done:
-                idx = futures[f]
+                idx  = futures[f]
                 name = accounts[idx]["name"]
                 try:
                     usage_map[name] = f.result()
                 except Exception:
                     usage_map[name] = None
                 loaded.add(name)
+                recompute = True
                 update_row(idx)
 
-            # Animate spinners on unloaded rows
+            if recompute:
+                old_best    = best_idx[0]
+                best_idx[0] = compute_best()
+                if best_idx[0] != old_best:
+                    if old_best is not None:
+                        update_row(old_best)
+                    if best_idx[0] is not None:
+                        update_row(best_idx[0])
+
+            # Animate spinners on still-loading rows
             for i, acct in enumerate(accounts):
                 if acct["name"] not in loaded:
                     update_row(i)
 
-            # Check for input (non-blocking)
             readable, _, _ = select.select([sys.stdin], [], [], 0.1)
             if readable:
-                ch = sys.stdin.read(1)
-                if ch == "q" or ch == "\x03":  # q or Ctrl-C
-                    done = True
-                elif ch.isdigit() and 1 <= int(ch) <= n:
-                    selected = int(ch) - 1
-                    done = True
+                done = handle_key(read_key(), selected)
 
-            # Once all loaded: play one rainbow wave sweep, then wait normally
+            # Rainbow wave sweep once all loaded, then wait for input
             if len(loaded) == n and not done:
-                # Sweep wave across (max col ~80 + row offset ~n*3)
-                max_pos = 90 + n
+                max_pos    = 90 + n
                 wave_start = time.monotonic()
                 wave_speed = args.wave_speed
                 while not done:
-                    elapsed = time.monotonic() - wave_start
+                    elapsed   = time.monotonic() - wave_start
                     wavefront = elapsed * wave_speed
                     wave_done = wavefront > max_pos + 12
                     for i in range(n):
                         update_row(i, wavefront=wavefront if not wave_done else -1.0)
                     readable, _, _ = select.select([sys.stdin], [], [], 0.02)
                     if readable:
-                        ch = sys.stdin.read(1)
-                        if ch == "q" or ch == "\x03":
-                            done = True
-                        elif ch.isdigit() and 1 <= int(ch) <= n:
-                            selected = int(ch) - 1
-                            done = True
+                        done = handle_key(read_key(), selected)
                     if wave_done:
-                        # Wave finished — redraw with normal colors, wait for input
                         for i in range(n):
                             update_row(i)
                         while not done:
                             readable, _, _ = select.select([sys.stdin], [], [], 0.5)
                             if readable:
-                                ch = sys.stdin.read(1)
-                                if ch == "q" or ch == "\x03":
-                                    done = True
-                                elif ch.isdigit() and 1 <= int(ch) <= n:
-                                    selected = int(ch) - 1
-                                    done = True
+                                done = handle_key(read_key(), selected)
     finally:
-        # Restore terminal
+        if selected[0] is not None:
+            _run_selection_animation(
+                selected[0], accounts, n, active,
+                usage_map, loaded, ansi_strip_re, args.wave_speed,
+            )
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         executor.shutdown(wait=False, cancel_futures=True)
 
-    if selected is None:
+    if selected[0] is None:
         print()
         return 0
 
-    # Activate the selected account
-    acct = accounts[selected]
-    name = acct["name"]
+    acct   = accounts[selected[0]]
+    name   = acct["name"]
     source = credential_dir(name) / "auth.json"
     if not source.exists():
         print(f"\nAccount '{name}' has no credentials. Run: cxm login {name}")
@@ -1534,9 +1982,7 @@ def cmd_interactive(args):
 
     target = DEFAULT_CODEX_HOME / "auth.json"
     if target.exists() and not target.is_symlink():
-        backup = DEFAULT_CODEX_HOME / "auth.json.backup"
-        shutil.copy2(target, backup)
-
+        shutil.copy2(target, DEFAULT_CODEX_HOME / "auth.json.backup")
     if target.exists() or target.is_symlink():
         target.unlink()
     target.symlink_to(source)
@@ -1560,4 +2006,7 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        os._exit(130)
