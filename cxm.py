@@ -1851,11 +1851,11 @@ def cmd_interactive(args):
 
     def read_key() -> str:
         """Return a logical key name: 'UP', 'DOWN', 'ENTER', or the raw char."""
-        ch = sys.stdin.read(1)
+        ch = os.read(fd, 1).decode("utf-8", errors="replace")
         if ch == "\033":
-            avail, _, _ = select.select([sys.stdin], [], [], 0.05)
+            avail, _, _ = select.select([fd], [], [], 0.05)
             if avail:
-                rest = sys.stdin.read(2)
+                rest = os.read(fd, 2).decode("utf-8", errors="replace")
                 if rest == "[A": return "UP"
                 if rest == "[B": return "DOWN"
         if ch in ("\r", "\n"):
@@ -1935,7 +1935,7 @@ def cmd_interactive(args):
                 if acct["name"] not in loaded:
                     update_row(i)
 
-            readable, _, _ = select.select([sys.stdin], [], [], 0.1)
+            readable, _, _ = select.select([fd], [], [], 0.1)
             if readable:
                 done = handle_key(read_key(), selected)
 
@@ -1950,14 +1950,14 @@ def cmd_interactive(args):
                     wave_done = wavefront > max_pos + 12
                     for i in range(n):
                         update_row(i, wavefront=wavefront if not wave_done else -1.0)
-                    readable, _, _ = select.select([sys.stdin], [], [], 0.02)
+                    readable, _, _ = select.select([fd], [], [], 0.02)
                     if readable:
                         done = handle_key(read_key(), selected)
                     if wave_done:
                         for i in range(n):
                             update_row(i)
                         while not done:
-                            readable, _, _ = select.select([sys.stdin], [], [], 0.5)
+                            readable, _, _ = select.select([fd], [], [], 0.5)
                             if readable:
                                 done = handle_key(read_key(), selected)
     finally:
