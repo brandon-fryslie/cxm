@@ -1,175 +1,143 @@
-# cxm — Codex Multi-Account Credential Manager
+# cxm
 
-Manage multiple Codex CLI accounts from a single machine. Monitor usage and quota across all accounts at a glance, and intelligently switch to the account with the most remaining capacity.
-
-## How It Works
-
-`cxm` is a credential vault. Each account's `auth.json` is stored independently in `~/.codex-accounts/credentials/<name>/`. When you activate an account, `cxm` symlinks that `auth.json` into your real `~/.codex/` — your config, skills, rules, and everything else stays untouched.
+**Codex Multi-Account Credential Manager** — a zero-dependency, single-file CLI that juggles multiple [Codex CLI](https://github.com/openai/codex) accounts so you don't have to.
 
 ```
-~/.codex/
-  auth.json → ~/.codex-accounts/credentials/work/auth.json   (symlink, swapped by cxm)
-  config.toml                                                  (yours, never touched)
-  skills/                                                      (yours, never touched)
-  ...
-
-~/.codex-accounts/
-  accounts.json              # account registry
-  credentials/
-    personal/auth.json       # credential vault
-    work/auth.json
-    side-project/auth.json
-  chrome-profiles/
-    personal/                # isolated Chrome data dirs
-    work/
+$ cxm
+   1.    yalla                     100% left    DEPLETED     4h 59m / 1d 3h
+   2.    maryfep-massimino         —
+   3.  → qwrj-kairova             100% left    100% left    4h 59m / 1d 3h
+   4.  ▶ brandon-fryslie-signup    100% left    1% left      2h 34m / 2d 13h
+   5.    kecaixteg1-dreamvoyage    100% left    100% left    4h 59m / 6d 23h
 ```
 
-## Requirements
+Live usage spinners. Rainbow wave on load. Arrow keys + Enter to activate.
 
-- Python 3.10+
-- [Codex CLI](https://github.com/openai/codex) (`codex` on PATH)
-- [CodexBar](https://codexbar.app/) (`codexbar` on PATH) — for usage/quota monitoring
-- Google Chrome — for isolated browser profiles (optional)
+---
+
+## What it does
+
+- **Vaults credentials** — each account gets its own `auth.json`, Chrome profile, and Keychain entries
+- **Swaps with a symlink** — activating an account symlinks its `auth.json` into `~/.codex/`, leaving your config/skills/rules untouched
+- **Monitors usage in parallel** — queries session and weekly quotas concurrently, shows remaining % and reset timers
+- **Picks the best account** — `cxm best` scores accounts by remaining quota and auto-activates the winner
+- **Automates login end-to-end** — CDP drives Chrome through the full OpenAI OAuth flow (email → password → TOTP) using credentials stored in macOS Keychain
+- **Bulk onboarding** — `cxm quick` parses pasted credential blocks and sets up multiple accounts in one shot
+- **Self-cleaning** — `cxm cleanup` validates all accounts and prompts to remove broken ones
 
 ## Install
 
-```bash
-# Clone and symlink onto PATH
-git clone <repo> ~/code/codex-login
-ln -s ~/code/codex-login/cxm /usr/local/bin/cxm
+Requires Python 3.10+ and macOS.
 
-# Or just alias it
-echo 'alias cxm="~/code/codex-login/cxm"' >> ~/.zshrc
+```bash
+uv tool install -e .
 ```
+
+Zero dependencies — stdlib only.
+
+### External tools
+
+| Tool | Required | Used for |
+|------|----------|----------|
+| [Codex CLI](https://github.com/openai/codex) | Yes | `codex login` for OAuth flow |
+| [CodexBar](https://codexbar.app/) | Yes | `codexbar usage` for quota monitoring |
+| Google Chrome | For auto-login | CDP automation of the OAuth flow |
 
 ## Quick Start
 
 ```bash
-# Add your first account (opens device-auth login flow)
+# Add your first account (opens OAuth flow, automates login if you provide credentials)
 cxm add personal -d "Personal Plus account"
 
-# Add more accounts
-cxm add work -d "Work Team account"
-cxm add side-project -d "Side project Pro"
+# Bulk-add accounts by pasting credentials
+cxm quick
 
-# See all accounts with usage
+# See everything at a glance
 cxm status
 
-# Switch to the best available account
-cxm best
+# Interactive TUI — arrow keys to browse, Enter to activate
+cxm
 
-# Or switch to a specific one
-cxm activate work
+# Or auto-pick the best account
+cxm best
 ```
 
 ## Commands
 
-### Account Management
+| Command | Description |
+|---------|-------------|
+| `cxm` | Interactive TUI — live usage, arrow keys, rainbow wave |
+| `cxm add <name>` | Create an account and run the login flow |
+| `cxm quick` | Paste credentials to bulk-add and auto-login accounts |
+| `cxm login <name>` | Re-login an existing account |
+| `cxm activate <name>` | Switch the active account |
+| `cxm best` | Auto-activate the account with most remaining quota |
+| `cxm status` | Table of all accounts with usage data |
+| `cxm cleanup` | Validate all accounts, prompt to remove broken ones |
+| `cxm refresh` | Check token status for all accounts |
+| `cxm env` | Print `eval`-able environment variables |
+| `cxm key` | Print the active account's API key |
+| `cxm chrome <name>` | Launch Chrome with the account's isolated profile |
+| `cxm remove <name>` | Delete an account and all its data |
+| `cxm list` | List account names (one per line, for scripting) |
+
+## How it works
+
+```
+~/.codex/
+  auth.json → symlink to active account (swapped by cxm)
+  config.toml, skills/, ...     (yours, never touched)
+
+~/.codex-accounts/
+  accounts.json                  # account registry (single source of truth)
+  credentials/
+    personal/auth.json           # vaulted tokens
+    work/auth.json
+  chrome-profiles/
+    personal/                    # isolated Chrome user-data-dirs
+    work/
+```
+
+Login credentials (email, password, TOTP secret) live in macOS Keychain under services `cxm-email`, `cxm-password`, `cxm-totp`.
+
+### Scoring algorithm
+
+`cxm best` ranks accounts by:
+
+1. **Weekly quota remaining** — primary factor (×100)
+2. **Session availability** — secondary (×10)
+3. **Reset urgency** — +500 bonus for quota that resets within 6 hours (use-it-or-lose-it)
+4. **Depletion penalty** — −10000 for accounts with no quota left
+
+### CDP auto-login
+
+When an account has credentials in Keychain, `cxm login` connects to Chrome via CDP (Chrome DevTools Protocol) over a stdlib WebSocket and drives the full OpenAI OAuth flow:
+
+1. Fill email → click Continue
+2. Wait for password field → fill password → submit
+3. Generate TOTP code → fill → submit
+4. Handle consent page → wait for OAuth redirect
+
+If authentication fails (e.g. "An error occurred during authentication"), the error is captured and the flow moves on to the next account.
+
+## Shell integration
 
 ```bash
-cxm add <name> [-d DESCRIPTION]   # Create account + login
-cxm login <name>                  # Re-login an existing account
-cxm remove <name>                 # Delete account (with confirmation)
-cxm list                          # List account names (for scripting)
-```
+# Quick switch shorthand
+ca() { cxm activate "$1"; }
 
-### Monitoring
-
-```bash
-cxm status                        # Usage table for all accounts
-cxm refresh                       # Refresh tokens for all accounts
-```
-
-`cxm status` shows a color-coded table with session usage, weekly usage, credits, and reset times for every account. The active account is marked with `→`.
-
-```
-   ACCOUNT          PLAN     EMAIL                            SESSION        WEEKLY         CREDITS    RESETS (S/W)
-   ───────────────  ───────  ───────────────────────────────  ─────────────  ─────────────  ─────────  ────────────────
-→  personal         plus     user1@gmail.com                  91% left       45% left       $5.00      2h 30m / 5d 18h
-   work             team     user2@company.com                100% left      12% left       $0         4h 15m / 3d 2h
-   side-project     pro      user3@gmail.com                  DEPLETED       DEPLETED       $50.00     45m / 1d 8h
-```
-
-### Switching Accounts
-
-```bash
-cxm activate <name>               # Symlink credentials into ~/.codex/
-cxm best                          # Auto-pick account with most remaining quota
-```
-
-`cxm best` scores accounts by:
-1. **Weekly quota remaining** (primary factor)
-2. **Session availability** (secondary)
-3. **Reset urgency** — bonus for quota that resets soon (use-it-or-lose-it)
-4. **Depletion penalty** — skip accounts with no quota left
-
-### Credential Provisioning
-
-```bash
-cxm env <name>                    # Print eval-able exports
-cxm key <name>                    # Print raw API key (for piping)
-```
-
-Use `env` to point other tools at a specific account without activating it globally:
-
-```bash
+# Point a one-off command at a specific account
 eval "$(cxm env work)" && codex "fix the bug"
-```
 
-Use `key` to pipe credentials to tools that accept an API key on stdin:
-
-```bash
+# Pipe API key to tools that accept stdin
 cxm key work | some-tool --api-key-stdin
 ```
 
-### Browser Profiles
-
-```bash
-cxm chrome <name> [--url URL]     # Launch Chrome with isolated profile
-```
-
-Each account gets its own Chrome user-data-dir, so you can be logged into multiple OpenAI dashboards simultaneously. Default URL is the OpenAI billing page.
-
-## Shell Integration
-
-Add to `~/.zshrc` or `~/.bashrc`:
-
-```bash
-alias cxm='~/code/codex-login/cxm'
-
-# Quick switch shorthand
-ca() { cxm activate "$1"; }
-```
-
-Then switching accounts is just:
-
-```bash
-ca work && codex "deploy the thing"
-```
-
-## Login Flow
-
-`cxm login` intercepts the auth URL from `codex login` output and opens it in Chrome with the account's isolated profile (`--user-data-dir`). The OpenAI auth page always requires manual login — there is no session-cookie shortcut. Chrome is automatically closed after login completes.
-
-Note: The codex CLI's Rust `webbrowser` crate calls macOS Launch Services directly, ignoring the `BROWSER` env var and `open` command. To work around this, `cxm` runs codex in a PTY to capture the auth URL in real time, then launches Chrome itself. Safari may also open (unavoidable); ignore it.
-
-## Data Storage
-
-All data lives in `~/.codex-accounts/`:
-
-| Path | Purpose |
-|------|---------|
-| `accounts.json` | Account registry (names, emails, plan types) |
-| `credentials/<name>/auth.json` | Per-account Codex credentials |
-| `chrome-profiles/<name>/` | Isolated Chrome user data directories |
-
-Your original `~/.codex/auth.json` is backed up to `~/.codex/auth.json.backup` the first time you activate an account.
-
-## Exit Codes
+## Exit codes
 
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
 | 1 | User error (bad args, account not found) |
-| 2 | Login/auth failure |
+| 2 | Auth failure |
 | 3 | Missing dependency (codex, codexbar, Chrome) |
