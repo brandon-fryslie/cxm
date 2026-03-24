@@ -28,6 +28,7 @@ import termios
 import threading
 import time
 import tty
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -377,32 +378,149 @@ def cdp_wait_for_navigation(cdp: _CDPConnection, timeout: float = 60.0):
 
 
 # ── Usage Querying ───────────────────────────────────────────────────────────
+# [LAW:one-source-of-truth] Usage data comes directly from the OpenAI API.
+
+_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+_REFRESH_URL = "https://auth.openai.com/oauth/token"
+_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+
+
+def _load_auth_tokens(name: str) -> dict | None:
+    """Load access_token and account_id from an account's auth.json."""
+    auth_path = credential_dir(name) / "auth.json"
+    if not auth_path.exists():
+        return None
+    with open(auth_path) as f:
+        data = json.load(f)
+    tokens = data.get("tokens", {})
+    access_token = tokens.get("access_token", "")
+    if not access_token:
+        # Fall back to OPENAI_API_KEY
+        access_token = data.get("OPENAI_API_KEY", "")
+    if not access_token:
+        return None
+    return {
+        "access_token": access_token,
+        "refresh_token": tokens.get("refresh_token", ""),
+        "account_id": tokens.get("account_id"),
+    }
+
+
+def _refresh_access_token(name: str, refresh_token: str) -> str | None:
+    """Refresh an expired access token. Returns new access token or None."""
+    if not refresh_token:
+        return None
+    body = json.dumps({
+        "client_id": _CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "scope": "openid profile email",
+    }).encode()
+    req = urllib.request.Request(
+        _REFRESH_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return None
+    new_access = data.get("access_token")
+    if not new_access:
+        return None
+    # Persist refreshed tokens
+    auth_path = credential_dir(name) / "auth.json"
+    with open(auth_path) as f:
+        auth_data = json.load(f)
+    tokens = auth_data.setdefault("tokens", {})
+    tokens["access_token"] = new_access
+    if "refresh_token" in data:
+        tokens["refresh_token"] = data["refresh_token"]
+    if "id_token" in data:
+        tokens["id_token"] = data["id_token"]
+    auth_data["last_refresh"] = datetime.now(timezone.utc).isoformat()
+    with open(auth_path, "w") as f:
+        json.dump(auth_data, f, indent=2)
+    return new_access
+
+
+def _fetch_usage_api(access_token: str, account_id: str | None) -> dict | None:
+    """Hit the OpenAI usage API and return raw JSON, or None on failure."""
+    req = urllib.request.Request(
+        _USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    if account_id:
+        req.add_header("ChatGPT-Account-Id", account_id)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+def _convert_window(window: dict | None) -> dict:
+    """Convert API window snapshot to the internal format used by display code."""
+    if not window:
+        return {}
+    reset_at = window.get("reset_at")
+    resets_at = (datetime.fromtimestamp(reset_at, tz=timezone.utc).isoformat()
+                 if reset_at else None)
+    return {
+        "usedPercent": window.get("used_percent"),
+        "resetsAt": resets_at,
+        "windowMinutes": (window.get("limit_window_seconds", 0) // 60) or None,
+    }
+
 
 def query_usage(name: str) -> dict | None:
-    """Query usage for a single account via codexbar CLI.
+    """Query usage for a single account via the OpenAI API.
 
-    Returns parsed JSON or None on failure.
+    Returns normalized usage dict or None on failure.
     """
-    cred_dir = credential_dir(name)
-    if not (cred_dir / "auth.json").exists():
+    tokens = _load_auth_tokens(name)
+    if not tokens:
+        return None
+    access_token = tokens["access_token"]
+    account_id = tokens.get("account_id")
+
+    try:
+        raw = _fetch_usage_api(access_token, account_id)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403) and tokens.get("refresh_token"):
+            new_token = _refresh_access_token(name, tokens["refresh_token"])
+            if not new_token:
+                return None
+            try:
+                raw = _fetch_usage_api(new_token, account_id)
+            except Exception:
+                return None
+        else:
+            return None
+    except Exception:
         return None
 
-    codexbar = shutil.which("codexbar")
-    if not codexbar:
+    if not raw:
         return None
 
-    env = os.environ.copy()
-    env["CODEX_HOME"] = str(cred_dir)
+    rate_limit = raw.get("rate_limit", {})
+    credits = raw.get("credits", {})
+    credits_remaining = credits.get("balance", 0) if credits else 0
 
-    result = subprocess.run(
-        [codexbar, "usage", "--provider", "codex", "--source", "cli", "--json", "--no-color"],
-        capture_output=True, text=True, env=env, timeout=30,
-    )
-    if result.returncode != 0:
-        return None
+    info = extract_account_info(credential_dir(name) / "auth.json")
 
-    data = json.loads(result.stdout)
-    return data[0] if data else None
+    return {
+        "usage": {
+            "primary": _convert_window(rate_limit.get("primary_window")),
+            "secondary": _convert_window(rate_limit.get("secondary_window")),
+            "accountEmail": info.get("email", ""),
+        },
+        "credits": {"remaining": credits_remaining or 0},
+        "plan_type": raw.get("plan_type", ""),
+    }
 
 
 def query_all_usage(accounts: list[dict]) -> dict[str, dict | None]:
@@ -1121,7 +1239,7 @@ def cmd_status(args):
             weekly_reset = secondary.get("resetsAt")
             credits_data = usage.get("credits")
 
-            # Use codexbar's email/plan if we don't have it
+            # Use usage API's email/plan if we don't have it
             if email == "—":
                 email = u.get("accountEmail", "—")
             if plan == "—":

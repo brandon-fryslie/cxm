@@ -28,7 +28,7 @@ Single-file CLI tool (`cxm.py`, ~1560 lines) that manages multiple Codex CLI acc
 
 **External tool integration:**
 - `codex login` — OAuth flow, run in a PTY (not a pipe) so Rust output isn't buffered; auth URL is intercepted from PTY output and Chrome is opened manually
-- `codexbar usage --provider codex --source cli --json` — usage/quota queries, parallelized via ThreadPoolExecutor
+- OpenAI usage API (`https://chatgpt.com/backend-api/wham/usage`) — usage/quota queries with OAuth token from auth.json, parallelized via ThreadPoolExecutor
 - Google Chrome at `/Applications/Google Chrome.app/...` — launched with `--user-data-dir` for per-account browser isolation and `--remote-debugging-port` for CDP
 
 **CDP auto-login layer:** If an account has credentials in macOS Keychain (services `cxm-email`, `cxm-password`, `cxm-totp`), `_cdp_automate_login` connects to Chrome via a stdlib WebSocket implementation and drives the OpenAI OAuth flow (email → password → TOTP) automatically. Credentials are stored/retrieved via `security find-generic-password`.

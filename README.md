@@ -40,7 +40,6 @@ Zero dependencies — stdlib only.
 | Tool | Required | Used for |
 |------|----------|----------|
 | [Codex CLI](https://github.com/openai/codex) | Yes | `codex login` for OAuth flow |
-| [CodexBar](https://codexbar.app/) | Yes | `codexbar usage` for quota monitoring |
 | Google Chrome | For auto-login | CDP automation of the OAuth flow |
 
 ## Quick Start
@@ -140,4 +139,4 @@ cxm key work | some-tool --api-key-stdin
 | 0 | Success |
 | 1 | User error (bad args, account not found) |
 | 2 | Auth failure |
-| 3 | Missing dependency (codex, codexbar, Chrome) |
+| 3 | Missing dependency (codex, Chrome) |
